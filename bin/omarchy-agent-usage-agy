@@ -5,7 +5,7 @@
 """Collect Google Antigravity (agy) usage into one display-ready JSON record.
 
 Local stats come from ~/.gemini/antigravity-cli/history.jsonl (prompts),
-conversation_summaries.db (sessions), and transcript logs (token metrics).
+conversation_summaries.db (sessions), and transcript logs (token metrics and limits).
 """
 
 from __future__ import annotations
@@ -21,6 +21,9 @@ from typing import Any
 
 AGENT_ID = "agy"
 AGENT_NAME = "Antigravity"
+DAILY_PROMPT_QUOTA = 100
+DAILY_TOKEN_QUOTA = 4_000_000
+CONTEXT_WINDOW_LIMIT = 1_000_000
 
 
 def get_agy_dir() -> Path:
@@ -54,11 +57,15 @@ def main() -> int:
   args = parser.parse_args()
 
   agy_dir = get_agy_dir()
-  now = dt.datetime.now()
+  now = dt.datetime.now().astimezone()
   today_str = now.strftime("%Y-%m-%d")
   recent_dates = [(now - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
 
-  # Active model from settings
+  # Calculate reset time at midnight
+  tomorrow_midnight = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+  daily_resets_at = tomorrow_midnight.isoformat()
+
+  # Active model from settings or presence
   tier_label = "Gemini 3.8 Flash"
   settings_file = agy_dir / "settings.json"
   if settings_file.exists():
@@ -128,13 +135,22 @@ def main() -> int:
   today_tokens = 0
   today_tokens_by_model: dict[str, int] = {}
   model_usage: dict[str, dict[str, int]] = {}
+  tokens_by_date: dict[str, int] = {d: 0 for d in recent_dates}
   total_tokens = 0
+  session_context_tokens = 0
 
   if brain_dir.exists():
+    latest_mtime = 0.0
     for root, _, files in os.walk(brain_dir):
       if "transcript.jsonl" in files:
         p = Path(root) / "transcript.jsonl"
         try:
+          mtime = p.stat().st_mtime
+          is_latest = mtime > latest_mtime
+          if is_latest:
+            latest_mtime = mtime
+
+          last_step_context = 0
           with open(p, "r", encoding="utf-8") as f:
             for line in f:
               if "input_tokens" in line or "output_tokens" in line:
@@ -142,31 +158,83 @@ def main() -> int:
                   item = json.loads(line)
                   inp = int(item.get("input_tokens") or 0)
                   out = int(item.get("output_tokens") or 0)
+                  cache_read = int(item.get("cache_read_tokens") or 0)
                   t = inp + out
+                  step_context = inp + cache_read
+                  if step_context > 0:
+                    last_step_context = step_context
+
+                  ca = item.get("created_at")
+                  d = local_date_string(ca) if ca else today_str
+                  if d in tokens_by_date:
+                    tokens_by_date[d] += t
+
                   if t > 0:
                     total_tokens += t
                     m = tier_label
                     bucket = model_usage.setdefault(
-                      m, {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+                      m, {
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0,
+                      }
                     )
                     bucket["inputTokens"] += inp
                     bucket["outputTokens"] += out
-                    bucket["totalTokens"] += t
-                    today_tokens += t
-                    today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + t
+                    bucket["cacheReadInputTokens"] += cache_read
+
+                    if d == today_str:
+                      today_tokens += t
+                      today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + t
                 except Exception:
                   pass
+
+          if is_latest and last_step_context > 0:
+            session_context_tokens = last_step_context
         except Exception:
           pass
 
-  recent_days = [{"date": d, "messageCount": prompts_by_date[d]} for d in recent_dates]
+  # recentDays in Omarchy stores token volume per day
+  recent_days = [
+    {"date": d, "messageCount": tokens_by_date.get(d, prompts_by_date.get(d, 0))}
+    for d in recent_dates
+  ]
   today_prompts = prompts_by_date.get(today_str, 0)
+
+  # Limits / quota meters
+  limits = []
+  prompt_percent = min(1.0, round(today_prompts / float(DAILY_PROMPT_QUOTA), 3))
+  limits.append({
+    "label": "Daily",
+    "title": "Daily Prompts",
+    "percent": prompt_percent,
+    "resetsAt": daily_resets_at,
+  })
+
+  if today_tokens > 0:
+    token_percent = min(1.0, round(today_tokens / float(DAILY_TOKEN_QUOTA), 3))
+    limits.append({
+      "label": "Daily",
+      "title": "Daily Tokens",
+      "percent": token_percent,
+      "resetsAt": daily_resets_at,
+    })
+
+  if session_context_tokens > 0:
+    context_percent = min(1.0, round(session_context_tokens / float(CONTEXT_WINDOW_LIMIT), 3))
+    limits.append({
+      "label": "Session",
+      "title": "Session Context",
+      "percent": context_percent,
+      "resetsAt": "",
+    })
 
   record = {
     "schemaVersion": 1,
     "id": AGENT_ID,
     "name": AGENT_NAME,
-    "updatedAt": now.astimezone().isoformat(),
+    "updatedAt": now.isoformat(),
     "ready": True,
     "hasLocalStats": True,
     "todayPrompts": today_prompts,
@@ -179,9 +247,9 @@ def main() -> int:
     "activeDays": len(active_dates),
     "activeDates": sorted(list(active_dates)),
     "modelUsage": model_usage,
-    "limits": [],
+    "limits": limits,
     "tierLabel": tier_label,
-    "usageStatusText": "Active",
+    "usageStatusText": "",
     "authHelpText": "",
   }
 

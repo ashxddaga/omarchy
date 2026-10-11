@@ -14,6 +14,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,9 +24,16 @@ from typing import Any
 
 AGENT_ID = "agy"
 AGENT_NAME = "Antigravity"
-DAILY_PROMPT_QUOTA = 100
-DAILY_TOKEN_QUOTA = 4_000_000
-CONTEXT_WINDOW_LIMIT = 1_000_000
+DEFAULT_MODEL = "Gemini 3.8 Flash"
+LIMITS_CACHE_SECONDS = 120
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+
+def get_agy_bin() -> str | None:
+  if "AGY_BIN" in os.environ:
+    custom = os.environ["AGY_BIN"]
+    return custom if (custom and (os.path.isfile(custom) or shutil.which(custom))) else None
+  return shutil.which("agy")
 
 
 def probe_authoritative_limits(force: bool = False) -> list[dict[str, Any]]:
@@ -34,51 +42,53 @@ def probe_authoritative_limits(force: bool = False) -> list[dict[str, Any]]:
 
   if not force and cache_file.exists():
     try:
-      if time.time() - cache_file.stat().st_mtime < 120:
+      if time.time() - cache_file.stat().st_mtime < LIMITS_CACHE_SECONDS:
         with open(cache_file, "r", encoding="utf-8") as f:
           return json.load(f)
     except Exception:
       pass
 
-  try:
-    cmd = ["agy", "-p", "/usage", "--output-format", "json"]
-    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
-    if proc.returncode == 0 and proc.stdout.strip():
-      data = json.loads(proc.stdout)
-      groups = data.get("command", {}).get("data", {}).get("groups", [])
-      limits = []
-      for group in groups:
-        group_name = group.get("name", "")
-        for bucket in group.get("buckets", []):
-          window = bucket.get("window", "")
-          rem = float(bucket.get("remaining_fraction", 1.0))
-          used = max(0.0, min(1.0, 1.0 - rem))
-          reset_time = bucket.get("reset_time", "")
+  agy_bin = get_agy_bin()
+  if agy_bin:
+    try:
+      cmd = [agy_bin, "-p", "/usage", "--output-format", "json"]
+      proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+      if proc.returncode == 0 and proc.stdout.strip():
+        data = json.loads(proc.stdout)
+        groups = data.get("command", {}).get("data", {}).get("groups", [])
+        limits = []
+        for group in groups:
+          group_name = group.get("name", "")
+          for bucket in group.get("buckets", []):
+            window = bucket.get("window", "")
+            rem = float(bucket.get("remaining_fraction", 1.0))
+            used = max(0.0, min(1.0, 1.0 - rem))
+            reset_time = bucket.get("reset_time", "")
 
-          if window == "5h":
-            label = "Session (5-hour)" if group_name == "Gemini Models" else f"{group_name} (5-hour)"
-          elif window == "weekly":
-            label = "Weekly (7-day)" if group_name == "Gemini Models" else f"{group_name} (Weekly)"
-          else:
-            label = f"{group_name} ({window})"
+            if window == "5h":
+              label = "Session (5-hour)" if group_name == "Gemini Models" else f"{group_name} (5-hour)"
+            elif window == "weekly":
+              label = "Weekly (7-day)" if group_name == "Gemini Models" else f"{group_name} (Weekly)"
+            else:
+              label = f"{group_name} ({window})"
 
-          limits.append({
-            "label": label,
-            "title": label,
-            "percent": round(used, 3),
-            "resetsAt": reset_time,
-          })
+            limits.append({
+              "label": label,
+              "title": label,
+              "percent": round(used, 3),
+              "resetsAt": reset_time,
+            })
 
-      if limits:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        try:
-          with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(limits, f)
-        except Exception:
-          pass
-        return limits
-  except Exception:
-    pass
+        if limits:
+          cache_dir.mkdir(parents=True, exist_ok=True)
+          try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+              json.dump(limits, f)
+          except Exception:
+            pass
+          return limits
+    except Exception:
+      pass
 
   if cache_file.exists():
     try:
@@ -114,6 +124,180 @@ def local_date_string(value: Any = None) -> str:
     return dt.datetime.now().strftime("%Y-%m-%d")
 
 
+def empty_stats(recent_dates: list[str]) -> dict[str, Any]:
+  return {
+    "hasLocalStats": False,
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [{"date": d, "messageCount": 0} for d in recent_dates],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+
+
+def scan_local_stats(agy_dir: Path, today_str: str, recent_dates: list[str]) -> dict[str, Any]:
+  prompts_by_date = {d: 0 for d in recent_dates}
+  total_prompts = 0
+  active_dates: set[str] = set()
+
+  history_file = agy_dir / "history.jsonl"
+  if history_file.is_file():
+    try:
+      with open(history_file, "r", encoding="utf-8") as f:
+        for line in f:
+          line = line.strip()
+          if not line:
+            continue
+          try:
+            entry = json.loads(line)
+            ts = entry.get("timestamp")
+            if ts:
+              d = local_date_string(ts)
+              active_dates.add(d)
+              total_prompts += 1
+              if d in prompts_by_date:
+                prompts_by_date[d] += 1
+          except Exception:
+            pass
+    except Exception:
+      pass
+
+  db_file = agy_dir / "conversation_summaries.db"
+  total_sessions = 0
+  today_sessions = 0
+  if db_file.is_file():
+    try:
+      conn = sqlite3.connect(db_file.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+      cur = conn.cursor()
+      cur.execute(
+        'SELECT COUNT(*) FROM conversation_summaries WHERE parent_conversation_id = "" OR parent_conversation_id IS NULL'
+      )
+      row = cur.fetchone()
+      if row:
+        total_sessions = int(row[0])
+
+      cur.execute(
+        'SELECT COUNT(*) FROM conversation_summaries WHERE (parent_conversation_id = "" OR parent_conversation_id IS NULL) AND last_modified_time LIKE ?',
+        (f"{today_str}%",),
+      )
+      row = cur.fetchone()
+      if row:
+        today_sessions = int(row[0])
+      conn.close()
+    except Exception:
+      pass
+
+  brain_dir = agy_dir / "brain"
+  today_tokens = 0
+  today_tokens_by_model: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  tokens_by_date: dict[str, int] = {d: 0 for d in recent_dates}
+  total_tokens = 0
+
+  if brain_dir.is_dir():
+    for root, _, files in os.walk(brain_dir):
+      if "transcript.jsonl" in files:
+        p = Path(root) / "transcript.jsonl"
+        try:
+          with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+              if "input_tokens" in line or "output_tokens" in line:
+                try:
+                  item = json.loads(line)
+                  inp = int(item.get("input_tokens") or 0)
+                  out = int(item.get("output_tokens") or 0)
+                  cache_read = int(item.get("cache_read_tokens") or 0)
+                  t = inp + out
+                  if t > 0:
+                    ca = item.get("created_at")
+                    d = local_date_string(ca) if ca else today_str
+                    m = str(item.get("model") or item.get("model_name") or item.get("model_id") or "unknown").strip() or "unknown"
+
+                    total_tokens += t
+                    if d in tokens_by_date:
+                      tokens_by_date[d] += t
+                    active_dates.add(d)
+
+                    bucket = model_usage.setdefault(
+                      m, {
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                        "cacheReadInputTokens": 0,
+                        "cacheCreationInputTokens": 0,
+                      }
+                    )
+                    bucket["inputTokens"] += inp
+                    bucket["outputTokens"] += out
+                    bucket["cacheReadInputTokens"] += cache_read
+
+                    if d == today_str:
+                      today_tokens += t
+                      today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + t
+                except Exception:
+                  pass
+        except Exception:
+          pass
+
+  recent_days = [
+    {"date": d, "messageCount": tokens_by_date.get(d, 0)}
+    for d in recent_dates
+  ]
+  today_prompts = prompts_by_date.get(today_str, 0)
+  has_local_stats = bool(total_prompts > 0 or total_sessions > 0 or total_tokens > 0)
+
+  return {
+    "hasLocalStats": has_local_stats,
+    "todayPrompts": today_prompts,
+    "todaySessions": today_sessions,
+    "todayTotalTokens": today_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": recent_days,
+    "totalPrompts": total_prompts,
+    "totalSessions": total_sessions,
+    "activeDays": len(active_dates),
+    "activeDates": sorted(list(active_dates)),
+    "modelUsage": model_usage,
+  }
+
+
+def cached_local_stats(agy_dir: Path, today_str: str, recent_dates: list[str], max_age: float) -> dict[str, Any]:
+  cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  cache_file = cache_dir / "agy-stats.json"
+
+  if max_age > 0 and cache_file.exists():
+    try:
+      with open(cache_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if (
+        data.get("agy_dir") == str(agy_dir)
+        and data.get("day") == today_str
+        and (time.time() - float(data.get("at", 0)) < max_age)
+      ):
+        return data.get("stats", {})
+    except Exception:
+      pass
+
+  stats = scan_local_stats(agy_dir, today_str, recent_dates)
+  cache_dir.mkdir(parents=True, exist_ok=True)
+  try:
+    with open(cache_file, "w", encoding="utf-8") as f:
+      json.dump({
+        "agy_dir": str(agy_dir),
+        "day": today_str,
+        "at": time.time(),
+        "stats": stats,
+      }, f)
+  except Exception:
+    pass
+
+  return stats
+
+
 def write_atomic(target_path: Path, text: str) -> None:
   target_path.parent.mkdir(parents=True, exist_ok=True)
   tmp = target_path.with_suffix(f".tmp.{os.getpid()}")
@@ -142,198 +326,60 @@ def main() -> int:
   today_str = now.strftime("%Y-%m-%d")
   recent_dates = [(now - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
 
-  # Calculate reset time at midnight
-  tomorrow_midnight = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-  daily_resets_at = tomorrow_midnight.isoformat()
-
-  # Active model from settings or presence
-  tier_label = "Gemini 3.8 Flash"
-  settings_file = agy_dir / "settings.json"
-  if settings_file.exists():
-    try:
-      with open(settings_file, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-        if "model" in cfg and cfg["model"]:
-          tier_label = str(cfg["model"])
-    except Exception:
-      pass
-
-  # Read prompts and recent dates from history.jsonl
+  has_binary = get_agy_bin() is not None
   history_file = agy_dir / "history.jsonl"
-  prompts_by_date = {d: 0 for d in recent_dates}
-  total_prompts = 0
-  active_dates: set[str] = set()
-
-  if history_file.exists():
-    try:
-      with open(history_file, "r", encoding="utf-8") as f:
-        for line in f:
-          line = line.strip()
-          if not line:
-            continue
-          try:
-            entry = json.loads(line)
-            ts = entry.get("timestamp")
-            if ts:
-              d = local_date_string(ts)
-              active_dates.add(d)
-              total_prompts += 1
-              if d in prompts_by_date:
-                prompts_by_date[d] += 1
-          except Exception:
-            pass
-    except Exception:
-      pass
-
-  # Read sessions from conversation_summaries.db
   db_file = agy_dir / "conversation_summaries.db"
-  total_sessions = 0
-  today_sessions = 0
-  if db_file.exists():
-    try:
-      conn = sqlite3.connect(f"file:{db_file}?immutable=1", uri=True)
-      cur = conn.cursor()
-      cur.execute(
-        'SELECT COUNT(*) FROM conversation_summaries WHERE parent_conversation_id = "" OR parent_conversation_id IS NULL'
-      )
-      row = cur.fetchone()
-      if row:
-        total_sessions = int(row[0])
-
-      cur.execute(
-        'SELECT COUNT(*) FROM conversation_summaries WHERE (parent_conversation_id = "" OR parent_conversation_id IS NULL) AND last_modified_time LIKE ?',
-        (f"{today_str}%",),
-      )
-      row = cur.fetchone()
-      if row:
-        today_sessions = int(row[0])
-      conn.close()
-    except Exception:
-      pass
-
-  # Read token usage from transcripts
   brain_dir = agy_dir / "brain"
-  today_tokens = 0
-  today_tokens_by_model: dict[str, int] = {}
-  model_usage: dict[str, dict[str, int]] = {}
-  tokens_by_date: dict[str, int] = {d: 0 for d in recent_dates}
-  total_tokens = 0
-  session_context_tokens = 0
+  has_files = (
+    (history_file.is_file() and history_file.stat().st_size > 0)
+    or (db_file.is_file() and db_file.stat().st_size > 0)
+    or (brain_dir.is_dir() and any(brain_dir.iterdir()))
+  )
 
-  if brain_dir.exists():
-    latest_mtime = 0.0
-    for root, _, files in os.walk(brain_dir):
-      if "transcript.jsonl" in files:
-        p = Path(root) / "transcript.jsonl"
+  if not has_binary and not has_files:
+    record: dict[str, Any] = {
+      "schemaVersion": 1,
+      "id": AGENT_ID,
+      "name": AGENT_NAME,
+      "updatedAt": now.isoformat(),
+      "ready": False,
+      "tierLabel": "",
+      "usageStatusText": "",
+      "authHelpText": "",
+      "limits": [],
+    }
+    record.update(empty_stats(recent_dates))
+  else:
+    limits = probe_authoritative_limits(force=args.force)
+    max_age = LIMITS_ONLY_REUSE_SECONDS if (args.limits_only and not args.force) else 0
+    stats = cached_local_stats(agy_dir, today_str, recent_dates, max_age)
+
+    ready = bool(limits) or stats["hasLocalStats"]
+    tier_label = ""
+    if ready:
+      tier_label = DEFAULT_MODEL
+      settings_file = agy_dir / "settings.json"
+      if settings_file.is_file():
         try:
-          mtime = p.stat().st_mtime
-          is_latest = mtime > latest_mtime
-          if is_latest:
-            latest_mtime = mtime
-
-          last_step_context = 0
-          with open(p, "r", encoding="utf-8") as f:
-            for line in f:
-              if "input_tokens" in line or "output_tokens" in line:
-                try:
-                  item = json.loads(line)
-                  inp = int(item.get("input_tokens") or 0)
-                  out = int(item.get("output_tokens") or 0)
-                  cache_read = int(item.get("cache_read_tokens") or 0)
-                  t = inp + out
-                  step_context = inp + cache_read
-                  if step_context > 0:
-                    last_step_context = step_context
-
-                  ca = item.get("created_at")
-                  d = local_date_string(ca) if ca else today_str
-                  if d in tokens_by_date:
-                    tokens_by_date[d] += t
-
-                  if t > 0:
-                    total_tokens += t
-                    m = tier_label
-                    bucket = model_usage.setdefault(
-                      m, {
-                        "inputTokens": 0,
-                        "outputTokens": 0,
-                        "cacheReadInputTokens": 0,
-                        "cacheCreationInputTokens": 0,
-                      }
-                    )
-                    bucket["inputTokens"] += inp
-                    bucket["outputTokens"] += out
-                    bucket["cacheReadInputTokens"] += cache_read
-
-                    if d == today_str:
-                      today_tokens += t
-                      today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + t
-                except Exception:
-                  pass
-
-          if is_latest and last_step_context > 0:
-            session_context_tokens = last_step_context
+          with open(settings_file, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+            if "model" in cfg and cfg["model"]:
+              tier_label = str(cfg["model"])
         except Exception:
           pass
 
-  # recentDays in Omarchy stores token volume per day
-  recent_days = [
-    {"date": d, "messageCount": tokens_by_date.get(d, prompts_by_date.get(d, 0))}
-    for d in recent_dates
-  ]
-  today_prompts = prompts_by_date.get(today_str, 0)
-
-  # Limits / quota meters: query authoritative /usage from Antigravity CLI
-  limits = probe_authoritative_limits(force=args.force)
-  if not limits:
-    prompt_percent = min(1.0, round(today_prompts / float(DAILY_PROMPT_QUOTA), 3))
-    limits.append({
-      "label": "Daily",
-      "title": "Daily Prompts",
-      "percent": prompt_percent,
-      "resetsAt": daily_resets_at,
-    })
-
-    if today_tokens > 0:
-      token_percent = min(1.0, round(today_tokens / float(DAILY_TOKEN_QUOTA), 3))
-      limits.append({
-        "label": "Daily",
-        "title": "Daily Tokens",
-        "percent": token_percent,
-        "resetsAt": daily_resets_at,
-      })
-
-    if session_context_tokens > 0:
-      context_percent = min(1.0, round(session_context_tokens / float(CONTEXT_WINDOW_LIMIT), 3))
-      limits.append({
-        "label": "Session",
-        "title": "Session Context",
-        "percent": context_percent,
-        "resetsAt": "",
-      })
-
-  record = {
-    "schemaVersion": 1,
-    "id": AGENT_ID,
-    "name": AGENT_NAME,
-    "updatedAt": now.isoformat(),
-    "ready": True,
-    "hasLocalStats": True,
-    "todayPrompts": today_prompts,
-    "todaySessions": today_sessions,
-    "todayTotalTokens": today_tokens,
-    "todayTokensByModel": today_tokens_by_model,
-    "recentDays": recent_days,
-    "totalPrompts": total_prompts,
-    "totalSessions": total_sessions,
-    "activeDays": len(active_dates),
-    "activeDates": sorted(list(active_dates)),
-    "modelUsage": model_usage,
-    "limits": limits,
-    "tierLabel": tier_label,
-    "usageStatusText": "",
-    "authHelpText": "",
-  }
+    record = {
+      "schemaVersion": 1,
+      "id": AGENT_ID,
+      "name": AGENT_NAME,
+      "updatedAt": now.isoformat(),
+      "ready": ready,
+      "tierLabel": tier_label,
+      "usageStatusText": "",
+      "authHelpText": "",
+      "limits": limits,
+    }
+    record.update(stats)
 
   rendered = json.dumps(record, indent=2) + "\n"
   if args.write:
@@ -341,8 +387,9 @@ def main() -> int:
     usage_file = state_dir / "omarchy" / "agents" / "usage" / "agy.json"
     try:
       write_atomic(usage_file, rendered)
-    except Exception:
-      pass
+    except Exception as error:
+      sys.stderr.write(f"omarchy-agent-usage-agy: write failed: {error}\n")
+      return 1
 
   sys.stdout.write(rendered)
   return 0

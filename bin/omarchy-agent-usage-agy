@@ -15,7 +15,9 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,68 @@ AGENT_NAME = "Antigravity"
 DAILY_PROMPT_QUOTA = 100
 DAILY_TOKEN_QUOTA = 4_000_000
 CONTEXT_WINDOW_LIMIT = 1_000_000
+
+
+def probe_authoritative_limits(force: bool = False) -> list[dict[str, Any]]:
+  cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  cache_file = cache_dir / "agy-limits.json"
+
+  if not force and cache_file.exists():
+    try:
+      if time.time() - cache_file.stat().st_mtime < 120:
+        with open(cache_file, "r", encoding="utf-8") as f:
+          return json.load(f)
+    except Exception:
+      pass
+
+  try:
+    cmd = ["agy", "-p", "/usage", "--output-format", "json"]
+    proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    if proc.returncode == 0 and proc.stdout.strip():
+      data = json.loads(proc.stdout)
+      groups = data.get("command", {}).get("data", {}).get("groups", [])
+      limits = []
+      for group in groups:
+        group_name = group.get("name", "")
+        for bucket in group.get("buckets", []):
+          window = bucket.get("window", "")
+          rem = float(bucket.get("remaining_fraction", 1.0))
+          used = max(0.0, min(1.0, 1.0 - rem))
+          reset_time = bucket.get("reset_time", "")
+
+          if window == "5h":
+            label = "Session (5-hour)" if group_name == "Gemini Models" else f"{group_name} (5-hour)"
+          elif window == "weekly":
+            label = "Weekly (7-day)" if group_name == "Gemini Models" else f"{group_name} (Weekly)"
+          else:
+            label = f"{group_name} ({window})"
+
+          limits.append({
+            "label": label,
+            "title": label,
+            "percent": round(used, 3),
+            "resetsAt": reset_time,
+          })
+
+      if limits:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+          with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(limits, f)
+        except Exception:
+          pass
+        return limits
+  except Exception:
+    pass
+
+  if cache_file.exists():
+    try:
+      with open(cache_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+    except Exception:
+      pass
+
+  return []
 
 
 def get_agy_dir() -> Path:
@@ -219,33 +283,34 @@ def main() -> int:
   ]
   today_prompts = prompts_by_date.get(today_str, 0)
 
-  # Limits / quota meters
-  limits = []
-  prompt_percent = min(1.0, round(today_prompts / float(DAILY_PROMPT_QUOTA), 3))
-  limits.append({
-    "label": "Daily",
-    "title": "Daily Prompts",
-    "percent": prompt_percent,
-    "resetsAt": daily_resets_at,
-  })
-
-  if today_tokens > 0:
-    token_percent = min(1.0, round(today_tokens / float(DAILY_TOKEN_QUOTA), 3))
+  # Limits / quota meters: query authoritative /usage from Antigravity CLI
+  limits = probe_authoritative_limits(force=args.force)
+  if not limits:
+    prompt_percent = min(1.0, round(today_prompts / float(DAILY_PROMPT_QUOTA), 3))
     limits.append({
       "label": "Daily",
-      "title": "Daily Tokens",
-      "percent": token_percent,
+      "title": "Daily Prompts",
+      "percent": prompt_percent,
       "resetsAt": daily_resets_at,
     })
 
-  if session_context_tokens > 0:
-    context_percent = min(1.0, round(session_context_tokens / float(CONTEXT_WINDOW_LIMIT), 3))
-    limits.append({
-      "label": "Session",
-      "title": "Session Context",
-      "percent": context_percent,
-      "resetsAt": "",
-    })
+    if today_tokens > 0:
+      token_percent = min(1.0, round(today_tokens / float(DAILY_TOKEN_QUOTA), 3))
+      limits.append({
+        "label": "Daily",
+        "title": "Daily Tokens",
+        "percent": token_percent,
+        "resetsAt": daily_resets_at,
+      })
+
+    if session_context_tokens > 0:
+      context_percent = min(1.0, round(session_context_tokens / float(CONTEXT_WINDOW_LIMIT), 3))
+      limits.append({
+        "label": "Session",
+        "title": "Session Context",
+        "percent": context_percent,
+        "resetsAt": "",
+      })
 
   record = {
     "schemaVersion": 1,

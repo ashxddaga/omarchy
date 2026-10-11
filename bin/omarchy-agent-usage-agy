@@ -50,10 +50,27 @@ def local_date_string(value: Any = None) -> str:
     return dt.datetime.now().strftime("%Y-%m-%d")
 
 
+def write_atomic(target_path: Path, text: str) -> None:
+  target_path.parent.mkdir(parents=True, exist_ok=True)
+  tmp = target_path.with_suffix(f".tmp.{os.getpid()}")
+  try:
+    with open(tmp, "w", encoding="utf-8") as f:
+      f.write(text)
+    os.replace(tmp, target_path)
+  except Exception:
+    if tmp.exists():
+      try:
+        tmp.unlink()
+      except OSError:
+        pass
+    raise
+
+
 def main() -> int:
   parser = argparse.ArgumentParser(description="Print Antigravity usage record")
   parser.add_argument("--force", action="store_true", help="Force refresh cache")
   parser.add_argument("--limits-only", action="store_true", help="Only refresh rate limits")
+  parser.add_argument("--write", action="store_true", help="Atomically write usage JSON to state directory")
   args = parser.parse_args()
 
   agy_dir = get_agy_dir()
@@ -253,7 +270,16 @@ def main() -> int:
     "authHelpText": "",
   }
 
-  sys.stdout.write(json.dumps(record, indent=2) + "\n")
+  rendered = json.dumps(record, indent=2) + "\n"
+  if args.write:
+    state_dir = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    usage_file = state_dir / "omarchy" / "agents" / "usage" / "agy.json"
+    try:
+      write_atomic(usage_file, rendered)
+    except Exception:
+      pass
+
+  sys.stdout.write(rendered)
   return 0
 
 

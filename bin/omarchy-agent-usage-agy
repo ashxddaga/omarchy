@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Antigravity usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Google Antigravity (agy) usage into one display-ready JSON record.
+
+Local stats come from ~/.gemini/antigravity-cli/history.jsonl (prompts),
+conversation_summaries.db (sessions), and transcript logs (token metrics).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "agy"
+AGENT_NAME = "Antigravity"
+
+
+def get_agy_dir() -> Path:
+  custom = os.environ.get("AGY_DIR")
+  if custom:
+    return Path(custom).expanduser().resolve()
+  return Path.home() / ".gemini" / "antigravity-cli"
+
+
+def local_date_string(value: Any = None) -> str:
+  if value is None:
+    return dt.datetime.now().strftime("%Y-%m-%d")
+  if isinstance(value, (int, float)):
+    if value > 10_000_000_000:
+      value = value / 1000.0
+    return dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+  text = str(value).strip()
+  try:
+    parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+      parsed = parsed.astimezone()
+    return parsed.strftime("%Y-%m-%d")
+  except Exception:
+    return dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print Antigravity usage record")
+  parser.add_argument("--force", action="store_true", help="Force refresh cache")
+  parser.add_argument("--limits-only", action="store_true", help="Only refresh rate limits")
+  args = parser.parse_args()
+
+  agy_dir = get_agy_dir()
+  now = dt.datetime.now()
+  today_str = now.strftime("%Y-%m-%d")
+  recent_dates = [(now - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+  # Active model from settings
+  tier_label = "Gemini 3.8 Flash"
+  settings_file = agy_dir / "settings.json"
+  if settings_file.exists():
+    try:
+      with open(settings_file, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+        if "model" in cfg and cfg["model"]:
+          tier_label = str(cfg["model"])
+    except Exception:
+      pass
+
+  # Read prompts and recent dates from history.jsonl
+  history_file = agy_dir / "history.jsonl"
+  prompts_by_date = {d: 0 for d in recent_dates}
+  total_prompts = 0
+  active_dates: set[str] = set()
+
+  if history_file.exists():
+    try:
+      with open(history_file, "r", encoding="utf-8") as f:
+        for line in f:
+          line = line.strip()
+          if not line:
+            continue
+          try:
+            entry = json.loads(line)
+            ts = entry.get("timestamp")
+            if ts:
+              d = local_date_string(ts)
+              active_dates.add(d)
+              total_prompts += 1
+              if d in prompts_by_date:
+                prompts_by_date[d] += 1
+          except Exception:
+            pass
+    except Exception:
+      pass
+
+  # Read sessions from conversation_summaries.db
+  db_file = agy_dir / "conversation_summaries.db"
+  total_sessions = 0
+  today_sessions = 0
+  if db_file.exists():
+    try:
+      conn = sqlite3.connect(f"file:{db_file}?immutable=1", uri=True)
+      cur = conn.cursor()
+      cur.execute(
+        'SELECT COUNT(*) FROM conversation_summaries WHERE parent_conversation_id = "" OR parent_conversation_id IS NULL'
+      )
+      row = cur.fetchone()
+      if row:
+        total_sessions = int(row[0])
+
+      cur.execute(
+        'SELECT COUNT(*) FROM conversation_summaries WHERE (parent_conversation_id = "" OR parent_conversation_id IS NULL) AND last_modified_time LIKE ?',
+        (f"{today_str}%",),
+      )
+      row = cur.fetchone()
+      if row:
+        today_sessions = int(row[0])
+      conn.close()
+    except Exception:
+      pass
+
+  # Read token usage from transcripts
+  brain_dir = agy_dir / "brain"
+  today_tokens = 0
+  today_tokens_by_model: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  total_tokens = 0
+
+  if brain_dir.exists():
+    for root, _, files in os.walk(brain_dir):
+      if "transcript.jsonl" in files:
+        p = Path(root) / "transcript.jsonl"
+        try:
+          with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+              if "input_tokens" in line or "output_tokens" in line:
+                try:
+                  item = json.loads(line)
+                  inp = int(item.get("input_tokens") or 0)
+                  out = int(item.get("output_tokens") or 0)
+                  t = inp + out
+                  if t > 0:
+                    total_tokens += t
+                    m = tier_label
+                    bucket = model_usage.setdefault(
+                      m, {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}
+                    )
+                    bucket["inputTokens"] += inp
+                    bucket["outputTokens"] += out
+                    bucket["totalTokens"] += t
+                    today_tokens += t
+                    today_tokens_by_model[m] = today_tokens_by_model.get(m, 0) + t
+                except Exception:
+                  pass
+        except Exception:
+          pass
+
+  recent_days = [{"date": d, "messageCount": prompts_by_date[d]} for d in recent_dates]
+  today_prompts = prompts_by_date.get(today_str, 0)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": now.astimezone().isoformat(),
+    "ready": True,
+    "hasLocalStats": True,
+    "todayPrompts": today_prompts,
+    "todaySessions": today_sessions,
+    "todayTotalTokens": today_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": recent_days,
+    "totalPrompts": total_prompts,
+    "totalSessions": total_sessions,
+    "activeDays": len(active_dates),
+    "activeDates": sorted(list(active_dates)),
+    "modelUsage": model_usage,
+    "limits": [],
+    "tierLabel": tier_label,
+    "usageStatusText": "Active",
+    "authHelpText": "",
+  }
+
+  sys.stdout.write(json.dumps(record, indent=2) + "\n")
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

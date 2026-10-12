@@ -36,17 +36,33 @@ def get_agy_bin() -> str | None:
   return shutil.which("agy")
 
 
-def probe_authoritative_limits(force: bool = False) -> list[dict[str, Any]]:
+def probe_authoritative_limits(force: bool = False) -> dict[str, Any]:
   cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
   cache_file = cache_dir / "agy-limits.json"
 
-  if not force and cache_file.exists():
+  cached_payload: dict[str, Any] | list[Any] = {}
+  cached_limits: list[dict[str, Any]] = []
+  cached_fetched_at = 0
+  if cache_file.exists():
     try:
-      if time.time() - cache_file.stat().st_mtime < LIMITS_CACHE_SECONDS:
-        with open(cache_file, "r", encoding="utf-8") as f:
-          return json.load(f)
+      with open(cache_file, "r", encoding="utf-8") as f:
+        cached_payload = json.load(f)
+      if isinstance(cached_payload, dict):
+        cached_limits = cached_payload.get("limits") or []
+        cached_fetched_at = int(cached_payload.get("fetchedAtMs") or round(cache_file.stat().st_mtime * 1000))
+      elif isinstance(cached_payload, list):
+        cached_limits = cached_payload
+        cached_fetched_at = round(cache_file.stat().st_mtime * 1000)
     except Exception:
       pass
+
+  if not force and cached_limits:
+    if time.time() - (cached_fetched_at / 1000.0) < LIMITS_CACHE_SECONDS:
+      return {
+        "limits": cached_limits,
+        "stale": False,
+        "fetchedAtMs": cached_fetched_at,
+      }
 
   agy_bin = get_agy_bin()
   if agy_bin:
@@ -80,24 +96,33 @@ def probe_authoritative_limits(force: bool = False) -> list[dict[str, Any]]:
             })
 
         if limits:
-          cache_dir.mkdir(parents=True, exist_ok=True)
+          now_ms = round(time.time() * 1000)
           try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
             with open(cache_file, "w", encoding="utf-8") as f:
-              json.dump(limits, f)
+              json.dump({"fetchedAtMs": now_ms, "limits": limits}, f)
           except Exception:
             pass
-          return limits
+          return {
+            "limits": limits,
+            "stale": False,
+            "fetchedAtMs": now_ms,
+          }
     except Exception:
       pass
 
-  if cache_file.exists():
-    try:
-      with open(cache_file, "r", encoding="utf-8") as f:
-        return json.load(f)
-    except Exception:
-      pass
+  if cached_limits:
+    return {
+      "limits": cached_limits,
+      "stale": True,
+      "fetchedAtMs": cached_fetched_at,
+    }
 
-  return []
+  return {
+    "limits": [],
+    "stale": False,
+    "fetchedAtMs": 0,
+  }
 
 
 def get_agy_dir() -> Path:
@@ -283,8 +308,8 @@ def cached_local_stats(agy_dir: Path, today_str: str, recent_dates: list[str], m
       pass
 
   stats = scan_local_stats(agy_dir, today_str, recent_dates)
-  cache_dir.mkdir(parents=True, exist_ok=True)
   try:
+    cache_dir.mkdir(parents=True, exist_ok=True)
     with open(cache_file, "w", encoding="utf-8") as f:
       json.dump({
         "agy_dir": str(agy_dir),
@@ -347,14 +372,16 @@ def main() -> int:
       "usageStatusText": "",
       "authHelpText": "",
       "limits": [],
+      "limitsStale": False,
+      "limitsFetchedAt": 0,
     }
     record.update(empty_stats(recent_dates))
   else:
-    limits = probe_authoritative_limits(force=args.force)
+    limits_info = probe_authoritative_limits(force=args.force)
     max_age = LIMITS_ONLY_REUSE_SECONDS if (args.limits_only and not args.force) else 0
     stats = cached_local_stats(agy_dir, today_str, recent_dates, max_age)
 
-    ready = bool(limits) or stats["hasLocalStats"]
+    ready = bool(limits_info["limits"]) or stats["hasLocalStats"]
     tier_label = ""
     if ready:
       tier_label = DEFAULT_MODEL
@@ -377,7 +404,9 @@ def main() -> int:
       "tierLabel": tier_label,
       "usageStatusText": "",
       "authHelpText": "",
-      "limits": limits,
+      "limits": limits_info["limits"],
+      "limitsStale": limits_info["stale"],
+      "limitsFetchedAt": limits_info["fetchedAtMs"],
     }
     record.update(stats)
 

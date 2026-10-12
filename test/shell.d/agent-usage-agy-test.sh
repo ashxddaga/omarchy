@@ -8,6 +8,9 @@ require_command jq
 require_command python3
 require_command sqlite3
 
+# Pin timezone to UTC so date boundaries are consistent across environments
+export TZ=UTC
+
 test_tmp=$(mktemp -d)
 trap 'rm -rf "$test_tmp"' EXIT
 
@@ -27,7 +30,8 @@ yesterday_iso=$(python3 -c 'import datetime as dt; print((dt.datetime.now().asti
 
 # 1. A machine with no Antigravity installed or data gives an empty record
 record=$(AGY_BIN="" AGY_DIR="$test_tmp/nonexistent" "$COLLECTOR")
-[[ $(jq -c '{ready, tierLabel, limits, hasLocalStats}' <<<"$record") == '{"ready":false,"tierLabel":"","limits":[],"hasLocalStats":false}' ]] ||
+[[ $(jq -c '{ready, tierLabel, limits, limitsStale, limitsFetchedAt, hasLocalStats}' <<<"$record") == \
+   '{"ready":false,"tierLabel":"","limits":[],"limitsStale":false,"limitsFetchedAt":0,"hasLocalStats":false}' ]] ||
   fail "a machine nobody installed Antigravity on gives an empty record" "$record"
 pass "a machine nobody installed Antigravity on gives an empty record"
 
@@ -36,11 +40,11 @@ agy_dir="$test_tmp/agy"
 mkdir -p "$agy_dir/brain/session-1" "$agy_dir/brain/session-2"
 
 cat >"$agy_dir/history.jsonl" <<EOF
-{"timestamp":"${today}T10:00:00Z","prompt":"hello today 1"}
-{"timestamp":"${today}T11:00:00Z","prompt":"hello today 2"}
-{"timestamp":"${yesterday}T09:00:00Z","prompt":"hello yesterday 1"}
-{"timestamp":"${yesterday}T12:00:00Z","prompt":"hello yesterday 2"}
-{"timestamp":"${yesterday}T15:00:00Z","prompt":"hello yesterday 3"}
+{"timestamp":"${today}T10:00:00","prompt":"hello today 1"}
+{"timestamp":"${today}T11:00:00","prompt":"hello today 2"}
+{"timestamp":"${yesterday}T09:00:00","prompt":"hello yesterday 1"}
+{"timestamp":"${yesterday}T12:00:00","prompt":"hello yesterday 2"}
+{"timestamp":"${yesterday}T15:00:00","prompt":"hello yesterday 3"}
 EOF
 
 sqlite3 "$agy_dir/conversation_summaries.db" <<EOF
@@ -94,7 +98,7 @@ pass "model changes in settings.json do not rewrite historical modelUsage"
 
 # 4. Limits-only refresh reuses the session scan
 cat >>"$agy_dir/history.jsonl" <<EOF
-{"timestamp":"${today}T18:00:00Z","prompt":"hello later"}
+{"timestamp":"${today}T18:00:00","prompt":"hello later"}
 EOF
 
 record=$(AGY_BIN="" AGY_DIR="$agy_dir" "$COLLECTOR" --limits-only)
@@ -112,7 +116,7 @@ record=$(AGY_BIN="" AGY_DIR="$agy_dir" "$COLLECTOR" --limits-only)
   fail "a scan from another day is made again" "$record"
 pass "a scan from another day is made again"
 
-# 6. Authoritative limits probe via agy CLI
+# 6. Authoritative limits probe via agy CLI and staleness marking
 cat >"$test_tmp/bin/agy" <<'EOF'
 #!/bin/sh
 if [ "$2" = "/usage" ]; then
@@ -127,11 +131,33 @@ chmod +x "$test_tmp/bin/agy"
 
 rm -f "$XDG_CACHE_HOME/omarchy/agent-usage/agy-limits.json"
 record=$(AGY_BIN="$test_tmp/bin/agy" AGY_DIR="$agy_dir" "$COLLECTOR" --force)
-[[ $(jq -c '.limits[0] | {label, percent, resetsAt}' <<<"$record") == '{"label":"Session (5-hour)","percent":0.2,"resetsAt":"2026-10-12T00:00:00Z"}' ]] ||
-  fail "authoritative limits are parsed from agy /usage" "$record"
+[[ $(jq -c '{label: .limits[0].label, percent: .limits[0].percent, stale: .limitsStale}' <<<"$record") == \
+   '{"label":"Session (5-hour)","percent":0.2,"stale":false}' ]] ||
+  fail "fresh authoritative limits are parsed with limitsStale=false" "$record"
+[[ $(jq -r '.limitsFetchedAt' <<<"$record") -gt 0 ]] ||
+  fail "limitsFetchedAt timestamp is recorded" "$record"
 pass "authoritative limits are parsed from agy /usage"
 
-# 7. --write writes atomically to state file
+# When probe fails later, cached limits are preserved and marked stale
+cat >"$test_tmp/bin/agy" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+record=$(AGY_BIN="$test_tmp/bin/agy" AGY_DIR="$agy_dir" "$COLLECTOR" --force)
+[[ $(jq -c '{label: .limits[0].label, percent: .limits[0].percent, stale: .limitsStale}' <<<"$record") == \
+   '{"label":"Session (5-hour)","percent":0.2,"stale":true}' ]] ||
+  fail "failed probe preserves cached limits with limitsStale=true" "$record"
+pass "failed probe preserves cached limits with limitsStale=true"
+
+# 7. Unwritable cache directory does not stop usage scan
+bad_cache="$test_tmp/bad-cache-file"
+touch "$bad_cache"
+record=$(XDG_CACHE_HOME="$bad_cache" AGY_BIN="" AGY_DIR="$agy_dir" "$COLLECTOR")
+[[ $(jq -r '.ready' <<<"$record") == "true" && $(jq -r '.totalPrompts' <<<"$record") == "6" ]] ||
+  fail "collector still returns fresh usage when cache directory is unwritable" "$record"
+pass "collector still returns fresh usage when cache directory is unwritable"
+
+# 8. --write writes atomically to state file
 state_file="$XDG_STATE_HOME/omarchy/agents/usage/agy.json"
 rm -f "$state_file"
 AGY_BIN="" AGY_DIR="$agy_dir" "$COLLECTOR" --write >/dev/null
@@ -139,7 +165,7 @@ AGY_BIN="" AGY_DIR="$agy_dir" "$COLLECTOR" --write >/dev/null
   fail "collector --write saves atomic state record"
 pass "collector --write saves atomic state record"
 
-# 8. --write failure exits with nonzero code
+# 9. --write failure exits with nonzero code
 bad_state="$test_tmp/bad-state"
 touch "$bad_state"
 if XDG_STATE_HOME="$bad_state" AGY_BIN="" AGY_DIR="$agy_dir" "$COLLECTOR" --write 2>/dev/null; then

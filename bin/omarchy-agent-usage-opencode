@@ -90,6 +90,22 @@ def empty_stats(recent_dates: list[str]) -> dict[str, Any]:
   }
 
 
+def write_atomic(target_path: Path, text: str) -> None:
+  target_path.parent.mkdir(parents=True, exist_ok=True)
+  tmp = target_path.with_name(f"{target_path.name}.tmp.{os.getpid()}_{time.time_ns()}")
+  try:
+    with open(tmp, "w", encoding="utf-8") as f:
+      f.write(text)
+    os.replace(tmp, target_path)
+  except Exception:
+    if tmp.exists():
+      try:
+        tmp.unlink()
+      except OSError:
+        pass
+    raise
+
+
 def scan_local_stats(db_path: Path, today_str: str, recent_dates: list[str]) -> dict[str, Any]:
   tokens_by_date: dict[str, int] = {d: 0 for d in recent_dates}
   prompts_by_date: dict[str, int] = {d: 0 for d in recent_dates}
@@ -113,19 +129,49 @@ def scan_local_stats(db_path: Path, today_str: str, recent_dates: list[str]) -> 
     if conn is not None:
       try:
         conn.execute("PRAGMA query_only = ON")
-        rows = conn.execute(
-          "SELECT session_id, data, time_created FROM message"
-          " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
-          " AND CASE WHEN json_valid(data)"
-          " THEN json_extract(data, '$.role') END = 'assistant'"
-        )
-        for session_id, raw, time_created in rows:
+        tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        queries = []
+        if "message" in tables:
+          queries.append(("opencode:", "SELECT session_id, data, NULL, time_created FROM message"))
+        if "session_message" in tables:
+          queries.append(("opencode-v2:", "SELECT session_id, data, type, time_created FROM session_message"))
+
+        rows = ((prefix, row) for prefix, query in queries for row in conn.execute(query))
+        for session_prefix, (session_id, raw, row_type, time_created) in rows:
           try:
             entry = json.loads(raw)
             if not isinstance(entry, dict):
               continue
-            if entry.get("role") != "assistant":
+
+            if row_type is None:
+              role = entry.get("role")
+              provider = entry.get("providerID")
+              model_id = entry.get("modelID")
+              if not model_id and isinstance(entry.get("model"), dict):
+                model_info = entry.get("model") or {}
+                provider = provider or model_info.get("providerID")
+                model_id = model_info.get("id")
+              elif not model_id:
+                model_id = entry.get("model")
+            else:
+              role = row_type
+              model_info = entry.get("model") or {}
+              if isinstance(model_info, dict):
+                provider = model_info.get("providerID")
+                model_id = model_info.get("id")
+              else:
+                provider = entry.get("providerID")
+                model_id = model_info or entry.get("modelID")
+
+            if role != "assistant":
               continue
+
+            # Skip providers that have dedicated Omarchy collectors (Anthropic for Claude, OpenAI for Codex)
+            # to avoid double-counting messages in combined panel totals.
+            provider_str = str(provider or "").strip().lower()
+            if provider_str in ("anthropic", "openai"):
+              continue
+
             tokens = entry.get("tokens") or {}
             cache = tokens.get("cache") or {}
             inp = num(tokens.get("input"))
@@ -137,13 +183,14 @@ def scan_local_stats(db_path: Path, today_str: str, recent_dates: list[str]) -> 
             total = inp + out + cache_read + cache_write
             created = (entry.get("time") or {}).get("created") or time_created
             day = local_date_string(created)
-            model = str(entry.get("modelID") or entry.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+            model = str(model_id or DEFAULT_MODEL).strip() or DEFAULT_MODEL
           except Exception:
             continue
 
+          session_key = session_prefix + str(session_id)
           total_prompts += 1
           total_tokens += total
-          sessions.add(str(session_id))
+          sessions.add(session_key)
           active_dates.add(day)
 
           bucket = model_usage.setdefault(
@@ -167,7 +214,7 @@ def scan_local_stats(db_path: Path, today_str: str, recent_dates: list[str]) -> 
           if day == today_str:
             today_prompts += 1
             today_tokens += total
-            today_sessions.add(str(session_id))
+            today_sessions.add(session_key)
             today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
       except sqlite3.Error:
         pass
@@ -215,14 +262,15 @@ def cached_local_stats(db_path: Path, today_str: str, recent_dates: list[str], m
 
   stats = scan_local_stats(db_path, today_str, recent_dates)
   try:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    with open(cache_file, "w", encoding="utf-8") as f:
-      json.dump({
+    write_atomic(
+      cache_file,
+      json.dumps({
         "db_path": str(db_path),
         "day": today_str,
         "at": time.time(),
         "stats": stats,
-      }, f)
+      }),
+    )
   except Exception:
     pass
 
@@ -246,22 +294,6 @@ def resolve_tier_label(cfg_path: Path, model_usage: dict[str, Any]) -> str:
     if t > best_tokens:
       best_model, best_tokens = model, t
   return best_model or DEFAULT_MODEL
-
-
-def write_atomic(target_path: Path, text: str) -> None:
-  target_path.parent.mkdir(parents=True, exist_ok=True)
-  tmp = target_path.with_suffix(f".tmp.{os.getpid()}")
-  try:
-    with open(tmp, "w", encoding="utf-8") as f:
-      f.write(text)
-    os.replace(tmp, target_path)
-  except Exception:
-    if tmp.exists():
-      try:
-        tmp.unlink()
-      except OSError:
-        pass
-    raise
 
 
 def main() -> int:

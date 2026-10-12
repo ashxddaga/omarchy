@@ -154,3 +154,74 @@ if XDG_STATE_HOME="$bad_state" OPENCODE_BIN="" OPENCODE_DB="$db_file" OPENCODE_C
   fail "collector --write should fail when state directory is not writable"
 fi
 pass "collector --write exits with nonzero code on failure"
+
+# 9. Opencode ignores anthropic and openai messages to avoid double counting with Claude/Codex
+m_ant=$(jq -nc --arg model "claude-3-7-sonnet" --argjson t "$now_ms" \
+  '{"role":"assistant","providerID":"anthropic","modelID":$model,"time":{"created":$t},"tokens":{"input":1000,"output":500,"reasoning":0,"cache":{"read":0,"write":0}}}')
+m_oai=$(jq -nc --arg model "gpt-5" --argjson t "$now_ms" \
+  '{"role":"assistant","providerID":"openai","modelID":$model,"time":{"created":$t},"tokens":{"input":2000,"output":800,"reasoning":0,"cache":{"read":0,"write":0}}}')
+sqlite3 "$db_file" <<EOF
+INSERT INTO message VALUES ('m_ant', 's_overlap', $now_ms, $now_ms, '$m_ant');
+INSERT INTO message VALUES ('m_oai', 's_overlap', $now_ms, $now_ms, '$m_oai');
+EOF
+
+record=$(OPENCODE_BIN="" OPENCODE_DB="$db_file" OPENCODE_CONFIG="$cfg_file" "$COLLECTOR" --force)
+[[ $(jq -r '.totalPrompts' <<<"$record") == 4 ]] ||
+  fail "Opencode ignores anthropic and openai messages to avoid double counting" "$record"
+pass "Opencode ignores anthropic and openai messages to avoid double counting"
+
+# 10. Opencode reads v2 session_message in a mixed database
+sqlite3 "$db_file" <<EOF
+CREATE TABLE session_message (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  type text NOT NULL,
+  seq integer NOT NULL,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL,
+  data text NOT NULL
+);
+EOF
+
+v2_data=$(jq -nc --arg model "deepseek-chat" --argjson t "$now_ms" \
+  '{"model":{"id":$model,"providerID":"deepseek"},"time":{"created":$t},"tokens":{"input":300,"output":100,"reasoning":50,"cache":{"read":20,"write":0}}}')
+v2_ant=$(jq -nc --arg model "claude-opus-5" --argjson t "$now_ms" \
+  '{"model":{"id":$model,"providerID":"anthropic"},"time":{"created":$t},"tokens":{"input":999,"output":999}}')
+v2_oai=$(jq -nc --arg model "gpt-5-codex" --argjson t "$now_ms" \
+  '{"model":{"id":$model,"providerID":"openai"},"time":{"created":$t},"tokens":{"input":999,"output":999}}')
+v2_user='{"tokens":{"input":50,"output":0}}'
+
+sqlite3 "$db_file" <<EOF
+INSERT INTO session_message VALUES ('v1', 's_v2', 'assistant', 1, $now_ms, $now_ms, '$v2_data');
+INSERT INTO session_message VALUES ('v2', 's_v2', 'assistant', 2, $now_ms, $now_ms, '$v2_ant');
+INSERT INTO session_message VALUES ('v3', 's_v2', 'assistant', 3, $now_ms, $now_ms, '$v2_oai');
+INSERT INTO session_message VALUES ('v4', 's_v2', 'user', 4, $now_ms, $now_ms, '$v2_user');
+EOF
+
+record=$(OPENCODE_BIN="" OPENCODE_DB="$db_file" OPENCODE_CONFIG="$cfg_file" "$COLLECTOR" --force)
+# 4 previous prompts + 1 new deepseek prompt = 5 total prompts
+# deepseek tokens: 300 + 100 + 50 + 20 = 470
+[[ $(jq -r '.totalPrompts' <<<"$record") == 5 && $(jq -r '.modelUsage["deepseek-chat"].inputTokens' <<<"$record") == 300 ]] ||
+  fail "Opencode reads session_message rows and filters overlap in mixed database" "$record"
+pass "Opencode reads session_message rows and filters overlap in mixed database"
+
+# 11. Opencode counts usage from a v2-only database (no message table)
+v2_db="$test_tmp/v2_only.db"
+sqlite3 "$v2_db" <<EOF
+CREATE TABLE session_message (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  type text NOT NULL,
+  seq integer NOT NULL,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL,
+  data text NOT NULL
+);
+INSERT INTO session_message VALUES ('v_only', 's_v2only', 'assistant', 1, $now_ms, $now_ms, '$v2_data');
+EOF
+
+record=$(OPENCODE_BIN="" OPENCODE_DB="$v2_db" OPENCODE_CONFIG="$cfg_file" "$COLLECTOR" --force)
+[[ $(jq -r '.ready' <<<"$record") == "true" && $(jq -r '.totalPrompts' <<<"$record") == 1 && $(jq -r '.todayTotalTokens' <<<"$record") == 470 ]] ||
+  fail "Opencode counts usage from a v2-only database with session_message" "$record"
+pass "Opencode counts usage from a v2-only database with session_message"
+

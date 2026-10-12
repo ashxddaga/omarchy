@@ -199,11 +199,11 @@ INSERT INTO session_message VALUES ('v4', 's_v2', 'user', 4, $now_ms, $now_ms, '
 EOF
 
 record=$(OPENCODE_BIN="" OPENCODE_DB="$db_file" OPENCODE_CONFIG="$cfg_file" "$COLLECTOR" --force)
-# 4 previous prompts + 1 new deepseek prompt = 5 total prompts
-# deepseek tokens: 300 + 100 + 50 + 20 = 470
-[[ $(jq -r '.totalPrompts' <<<"$record") == 5 && $(jq -r '.modelUsage["deepseek-chat"].inputTokens' <<<"$record") == 300 ]] ||
-  fail "Opencode reads session_message rows and filters overlap in mixed database" "$record"
-pass "Opencode reads session_message rows and filters overlap in mixed database"
+# 4 previous prompts + 1 deepseek prompt + 1 openai v2 prompt = 6 total prompts
+# Anthropic v2 is skipped (collected by Claude); OpenAI v2 is counted (Codex only collects v1 message)
+[[ $(jq -r '.totalPrompts' <<<"$record") == 6 && $(jq -r '.modelUsage["deepseek-chat"].inputTokens' <<<"$record") == 300 && $(jq -r '.modelUsage["gpt-5-codex"].inputTokens' <<<"$record") == 999 ]] ||
+  fail "Opencode reads session_message rows, preserves v2 openai, and filters v2 anthropic" "$record"
+pass "Opencode reads session_message rows, preserves v2 openai, and filters v2 anthropic"
 
 # 11. Opencode counts usage from a v2-only database (no message table)
 v2_db="$test_tmp/v2_only.db"

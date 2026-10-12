@@ -132,9 +132,18 @@ def scan_local_stats(db_path: Path, today_str: str, recent_dates: list[str]) -> 
         tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         queries = []
         if "message" in tables:
-          queries.append(("opencode:", "SELECT session_id, data, NULL, time_created FROM message"))
+          queries.append((
+            "opencode:",
+            "SELECT session_id, data, NULL, time_created FROM message"
+            " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
+            " AND CASE WHEN json_valid(data) THEN json_extract(data, '$.role') END = 'assistant'",
+          ))
         if "session_message" in tables:
-          queries.append(("opencode-v2:", "SELECT session_id, data, type, time_created FROM session_message"))
+          queries.append((
+            "opencode-v2:",
+            "SELECT session_id, data, type, time_created FROM session_message"
+            " WHERE type = 'assistant'",
+          ))
 
         rows = ((prefix, row) for prefix, query in queries for row in conn.execute(query))
         for session_prefix, (session_id, raw, row_type, time_created) in rows:
@@ -166,10 +175,12 @@ def scan_local_stats(db_path: Path, today_str: str, recent_dates: list[str]) -> 
             if role != "assistant":
               continue
 
-            # Skip providers that have dedicated Omarchy collectors (Anthropic for Claude, OpenAI for Codex)
-            # to avoid double-counting messages in combined panel totals.
+            # Skip providers that have dedicated Omarchy collectors:
+            # - Claude collects both v1 (message) and v2 (session_message) Anthropic rows.
+            # - Codex currently only collects v1 (message) OpenAI rows. Keep v2 OpenAI rows
+            #   here so they aren't lost until Codex adds a v2 reader.
             provider_str = str(provider or "").strip().lower()
-            if provider_str in ("anthropic", "openai"):
+            if provider_str == "anthropic" or (row_type is None and provider_str == "openai"):
               continue
 
             tokens = entry.get("tokens") or {}
